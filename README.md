@@ -141,6 +141,18 @@ make cuda-generic     # Linux CUDA, other local CUDA GPUs
 make cpu              # CPU-only diagnostics build
 ```
 
+Experimental CUDA CPU/GPU hybrid decode can be enabled on this branch with:
+
+```sh
+DS4_CUDA_PARTIAL_WEIGHT_CACHE=1 DS4_CPU_GPU_HYBRID_FFN=1 ./ds4 --cuda -p "..."
+```
+
+This keeps attention, KV cache updates, and the output head on CUDA, but runs
+the decode FFN/MoE sublayer on CPU after each layer's attention step. Use
+`DS4_CPU_GPU_HYBRID_FFN_FROM` and `DS4_CPU_GPU_HYBRID_FFN_TO` to restrict the
+offloaded layer range while benchmarking. Prefill remains GPU-only in this
+first prototype.
+
 `./ds4flash.gguf` is the default model path used by both binaries. Pass `-m` to
 select another supported GGUF from `./gguf/`. Run `./ds4 --help` and
 `./ds4-server --help` for the full flag list.

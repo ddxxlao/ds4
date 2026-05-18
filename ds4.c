@@ -9275,6 +9275,77 @@ static uint32_t metal_graph_decode_indexer_top_k(const ds4_gpu_graph *g) {
     return DS4_N_INDEXER_TOP_K;
 }
 
+static bool metal_graph_hybrid_cpu_ffn_enabled(void) {
+    const char *env = getenv("DS4_CPU_GPU_HYBRID_FFN");
+    return env && env[0] && !(env[0] == '0' && env[1] == '\0');
+}
+
+static uint32_t metal_graph_hybrid_env_u32(const char *name, uint32_t fallback) {
+    const char *env = getenv(name);
+    if (!env || !env[0]) return fallback;
+    char *end = NULL;
+    unsigned long v = strtoul(env, &end, 10);
+    if (end == env || *end != '\0' || v > UINT32_MAX) return fallback;
+    return (uint32_t)v;
+}
+
+static bool metal_graph_hybrid_cpu_ffn_layer_enabled(uint32_t il) {
+    if (!metal_graph_hybrid_cpu_ffn_enabled()) return false;
+    const uint32_t from = metal_graph_hybrid_env_u32("DS4_CPU_GPU_HYBRID_FFN_FROM", 0);
+    const uint32_t to = metal_graph_hybrid_env_u32("DS4_CPU_GPU_HYBRID_FFN_TO", DS4_N_LAYER - 1u);
+    return il >= from && il <= to && il < DS4_N_LAYER;
+}
+
+static bool metal_graph_decode_layer_ffn_cpu(
+        ds4_gpu_graph          *g,
+        const ds4_model        *model,
+        const ds4_layer_weights *layer,
+        uint32_t                il,
+        int                     token) {
+    static bool notice_printed = false;
+    const uint64_t hc_dim = (uint64_t)DS4_N_HC * DS4_N_EMBD;
+    const uint64_t hc_bytes = hc_dim * sizeof(float);
+    float *after_attn_hc = xmalloc((size_t)hc_bytes);
+    float *after_ffn_hc = xmalloc((size_t)hc_bytes);
+
+    if (!notice_printed) {
+        fprintf(stderr,
+                "ds4: CPU/GPU hybrid decode FFN enabled; attention/KV stays on accelerator\n");
+        notice_printed = true;
+    }
+
+    /*
+     * This experimental hybrid boundary keeps attention/KV on the accelerator
+     * and offloads only decode FFN work to CPU.  End the current GPU command
+     * batch before reading the attention output, then reopen it after writing
+     * the CPU-produced HC state for the next layer/output head.
+     */
+    bool ok = ds4_gpu_end_commands() != 0;
+    if (ok) {
+        ok = ds4_gpu_tensor_read(g->after_attn_hc, 0, after_attn_hc, hc_bytes) != 0;
+    }
+    if (ok && metal_graph_directional_steering_ffn_enabled(g)) {
+        fprintf(stderr, "ds4: CPU/GPU hybrid FFN does not support GPU directional steering yet\n");
+        ok = false;
+    }
+    if (ok) {
+        layer_ffn_one(after_ffn_hc,
+                      model,
+                      layer,
+                      after_attn_hc,
+                      il,
+                      token,
+                      NULL,
+                      0.0f,
+                      false);
+        ok = ds4_gpu_tensor_write(g->after_ffn_hc, 0, after_ffn_hc, hc_bytes) != 0;
+    }
+    if (ok) ok = ds4_gpu_begin_commands() != 0;
+    free(after_ffn_hc);
+    free(after_attn_hc);
+    return ok;
+}
+
 /* =========================================================================
  * Metal Decode Release Helpers and Reference Fallbacks.
  * =========================================================================
@@ -9963,6 +10034,11 @@ static bool metal_graph_encode_decode_layer(
     DS4_METAL_PROFILE_DECODE_STAGE("attn_hc_post");
     if (ok) {
         metal_graph_debug_dump_tensor("hc_attn_post", g->after_attn_hc, hc_dim, il, pos);
+    }
+    if (ok && metal_graph_hybrid_cpu_ffn_layer_enabled(il)) {
+        ok = metal_graph_decode_layer_ffn_cpu(g, model, layer, il, token);
+        DS4_METAL_PROFILE_DECODE_STAGE("hybrid_cpu_ffn");
+        return ok;
     }
     if (ok) ok = ds4_gpu_rms_norm_plain_tensor(g->flat_hc, g->after_attn_hc, (uint32_t)hc_dim, DS4_RMS_EPS) != 0;
     if (ok) ok = metal_graph_matmul_plain_tensor(g->hc_mix, model, layer->hc_ffn_fn,
